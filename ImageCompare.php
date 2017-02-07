@@ -35,8 +35,9 @@ class ImageCompare
     {
         $this->config = parse_ini_file("imageCompare.conf", true);
         $this->prepareDbHandles();
-
         $this->logImageHashes();
+        $this->processResults();
+        $this->saveResultImages();
     }
 
     /**
@@ -53,22 +54,6 @@ class ImageCompare
             ],
         ]);
         return $lfS3Client;
-    }
-
-    /**
-     * @return \Aws\S3\S3Client
-     */
-    private function getTkS3Client()
-    {
-        $tkS3Client = new Aws\S3\S3Client([
-            'version' => 'latest',
-            'region' => 'eu-west-1',
-            'credentials' => [
-                'key' => $this->config['takeawayS3']['key'],
-                'secret' => $this->config['takeawayS3']['secret'],
-            ],
-        ]);
-        return $tkS3Client;
     }
 
     /**
@@ -108,19 +93,25 @@ class ImageCompare
         $this->plDb->exec('SET CHARACTER SET utf8');
     }
 
+    /**
+     * @desc Gets all lieferando category pictures of active restaurants and hashes them.
+     *       The hash is set as an array key. If another category has the same image, it will be set on the
+     *       same array key, incrementing it, thus indicating a duplicated category Image
+     */
     public function logImageHashes()
     {
-        $lfFetch = $this->lfDb->prepare("SELECT `id`
+        $lfFetch = $this->plDb->prepare("SELECT `id`
                                             FROM `restaurants`
                                             WHERE `status`
-                                            NOT IN ('11','18', '19', '30', '31')");
+                                            NOT IN ('11','18', '19', '30', '31')
+                                            AND `id` > 19936");
         $lfFetch->execute();
         $activeRestaurantIds = $lfFetch->fetchAll();
 
         foreach($activeRestaurantIds as $restaurantId)
         {
             echo("Checking Restaurant with ID:" . $restaurantId["id"] . PHP_EOL);
-            $categoryFetch = $this->lfDb->prepare("SELECT * FROM meal_categories WHERE restaurantId = :id");
+            $categoryFetch = $this->plDb->prepare("SELECT * FROM meal_categories WHERE restaurantId = :id");
             $categoryFetch->bindParam(":id", $restaurantId["id"]);
             $categoryFetch->execute();
             $lfCategories = $categoryFetch->fetchAll();
@@ -128,9 +119,7 @@ class ImageCompare
             $i = 0;
             foreach($lfCategories as $lfCategory)
             {
-
-
-                $categoryPictureFetch = $this->lfDb->prepare("SELECT * from category_picture where id = :id");
+                $categoryPictureFetch = $this->plDb->prepare("SELECT * from category_picture where id = :id");
                 $categoryPictureFetch->bindParam(":id", $lfCategory["categoryPictureId"]);
                 $categoryPictureFetch->execute();
                 $categoryPicture = $categoryPictureFetch->fetchAll();
@@ -148,7 +137,8 @@ class ImageCompare
                         }
 
                         if(isset($this->hashArray[md5($data)]["categoryId"])) {
-                            $this->hashArray[md5($data)]["categoryId"] .= ", " . $lfCategory["id"];;
+                            $this->hashArray[md5($data)]["categoryId"] .= ", " . $lfCategory["id"];
+
                         } else {
                             $this->hashArray[md5($data)]["categoryId"] = $lfCategory["id"];
                         }
@@ -158,6 +148,14 @@ class ImageCompare
                         } else {
                             $this->hashArray[md5($data)]["categoryPictureId"] = $categoryPicture[0]["id"];
                         }
+
+                        if(isset($this->hashArray[md5($data)]["restaurantId"])) {
+                            $this->hashArray[md5($data)]["restaurantId"] .= ", " . $restaurantId["id"];
+                        } else {
+                            $this->hashArray[md5($data)]["restaurantId"] =  $restaurantId["id"];
+                        }
+
+
                     }
                 }
                 $this->progressBar(++$i, sizeof($lfCategories));
@@ -167,26 +165,17 @@ class ImageCompare
         }
     }
 
-    public function checkHashArray()
-    {
-        foreach($this->hashArray as $key => $value)
-        {
-            if($value["occurrences"] > 1) {
-                echo("Duplicates found. Categories: " . PHP_EOL);
-                echo($value["categoryPictureId"] . PHP_EOL);
-            }
-        }
-    }
     /**
+     * @desc Donwloads a lieferando category image from S3
      * @param $categoryPictureId
      * @return null|string
      */
     private function downloadLfCategoryImage($categoryPictureId)
     {
-        $bucket = $this->config['lieferandoS3']['bucket'];
+        $bucket = $this->config['pyszneS3']['bucket'];
         $prefix = "category_pictures/{$categoryPictureId}/";
 
-        $s3Iterator = $this->getLfS3Client()->getIterator('ListObjects', [
+        $s3Iterator = $this->getPlS3Client()->getIterator('ListObjects', [
             'Bucket' => $bucket,
             'Prefix' => $prefix
         ]);
@@ -202,7 +191,7 @@ class ImageCompare
 
         $imageData = null;
         if ($imagePath) {
-            $result = $this->getLfS3Client()->getObject([
+            $result = $this->getPlS3Client()->getObject([
                 'Bucket' => $bucket,
                 'Key' => $imagePath,
             ]);
@@ -213,6 +202,11 @@ class ImageCompare
         return $imageData;
     }
 
+    /**
+     * @desc Display a visual cli progress bar
+     * @param $done
+     * @param $total
+     */
     private function progressBar($done, $total) {
         $perc = floor(($done / $total) * 100);
         $left = 100 - $perc;
@@ -220,11 +214,68 @@ class ImageCompare
         fwrite(STDERR, $write);
     }
 
+    /**
+     * @desc Saves the hash array to a .txt file
+     * @param $array
+     */
     private function saveToFile($array)
     {
         $string_data = serialize($array);
-        file_put_contents("ImageDuplicates.txt", $string_data);
+        file_put_contents("HashArray.txt", $string_data);
     }
+
+    /**
+     * Processes the hash array and filters out all category images that are duplicated
+     */
+    public function processResults()
+    {
+        $values = file_get_contents("HashArray.txt");
+        $values = unserialize($values);
+        foreach($values as $hash => $value) {
+            if($value["occurrences"] > 1) {
+                $exampleCategory = strstr($value["categoryId"], ",", true);
+
+                $string = "CategoryID: " . $exampleCategory  . " | Occurrences: " . $value["occurrences"] . PHP_EOL;
+
+                file_put_contents("FilteredResults.txt", $string, FILE_APPEND | LOCK_EX);
+            }
+        }
+    }
+
+    /**
+     * @desc Downloads the category images and saves them as categoryPictureID.png
+     */
+    public function saveResultImages()
+    {
+        $values = file_get_contents("ImageDuplicates.txt");
+        $values = unserialize($values);
+        foreach($values as $hash => $value) {
+            if($value["occurrences"] > 1) {
+                $exampleCategory = strstr($value["categoryId"], ",", true);
+
+                $categoryFetch = $this->plDb->prepare("SELECT * FROM meal_categories WHERE id = :id");
+                $categoryFetch->bindParam(":id", $exampleCategory);
+                $categoryFetch->execute();
+                $lfCategory = $categoryFetch->fetchAll();
+
+                $categoryPictureFetch = $this->plDb->prepare("SELECT * from category_picture where id = :id");
+                $categoryPictureFetch->bindParam(":id", $lfCategory[0]["categoryPictureId"]);
+                $categoryPictureFetch->execute();
+                $categoryPicture = $categoryPictureFetch->fetchAll();
+
+                if(isset($categoryPicture)) {
+                    $data = $this->downloadLfCategoryImage($lfCategory[0]["categoryPictureId"]);
+                    if($data != null) {
+                        $im = imagecreatefromstring($data);
+                        header('Content-Type: image/png');
+                        imagepng($im, "savedImages/" . $exampleCategory . ".png");
+                        imagedestroy($im);
+                    }
+                }
+            }
+        }
+    }
+
 
 }
 
